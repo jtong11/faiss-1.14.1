@@ -37,21 +37,11 @@ int main(void) {
     };
     const float xq[d] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    FaissIndexHNSWFlat* index = NULL;
-    FAISS_TRY(faiss_IndexHNSWFlat_new_with_metric(
-            &index, d, 16, METRIC_L2));
+    FaissIndexHNSWSQ* index = NULL;
+    FAISS_TRY(faiss_IndexHNSWSQ_new_with_metric(
+            &index, d, QT_fp16, 16, METRIC_L2));
     assert(faiss_Index_is_trained(index) != 0);
-
-    FaissIndexHNSW* hnsw = faiss_IndexHNSW_cast(index);
-    assert(hnsw != NULL);
-    assert(faiss_IndexHNSWFlat_cast(index) == index);
-
-    int nb_neighbors = 0;
-    FAISS_TRY(faiss_IndexHNSW_nb_neighbors(hnsw, 0, &nb_neighbors));
-    assert(nb_neighbors == 32);
-
-    faiss_IndexHNSW_set_efSearch(hnsw, 32);
-    assert(faiss_IndexHNSW_efSearch(hnsw) == 32);
+    assert(faiss_IndexHNSWSQ_cast(index) == index);
 
     FAISS_TRY(faiss_Index_add(index, nb, xb));
     assert(faiss_Index_ntotal(index) == nb);
@@ -62,8 +52,8 @@ int main(void) {
     assert(labels[0] == 0);
     assert(distances[0] == 0.0f);
 
-    faiss_IndexHNSWFlat_free(index);
+    faiss_IndexHNSWSQ_free(index);
 
-    printf("example_hnsw_c: OK\n");
+    printf("example_hnsw_sq_c: OK\n");
     return 0;
 }
