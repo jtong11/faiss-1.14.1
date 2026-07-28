@@ -140,9 +140,11 @@ inherit.repair-wheel-command = "append"
 repair-wheel-command = "pipx run abi3audit --strict --report {wheel}"
 
 # Linux (manylinux): Install OpenBLAS (threaded variant for multi-threaded BLAS).
+# EPEL's openssl3-libs provides libssl.so.3 for Python build tools linked
+# against OpenSSL 3 inside the manylinux container.
 [[tool.cibuildwheel.overrides]]
 select = "*-manylinux*"
-before-all = "dnf install -y openblas-devel openblas-openmp"
+before-all = "dnf install -y epel-release && dnf install -y openblas-devel openblas-openmp openssl3-libs"
 
 # Linux (musllinux/Alpine): OpenBLAS via apk (no dnf). Raise the OpenMP worker
 # stack above musl's ~128 KB default to avoid SIGSEGV in HNSW/IVF (glibc parity).

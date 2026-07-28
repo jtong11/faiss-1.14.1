@@ -128,8 +128,10 @@ test-command = "python -m pytest {project}/tests/test_wheel_smoke_gpu.py -v"
 # cuVS dev files (headers + cmake) come from RAPIDS' manylinux PyPI wheels via
 # `pip install --target /opt/cuvs` — ABI-clean, so no libstdc++/libgcc_s/libgomp strip
 # or RMM symlink shim. cp311 interpreter is explicit (manylinux puts no `pip` on PATH).
+# openssl3-libs provides libssl.so.3 for Python/CUDA build tools linked against
+# OpenSSL 3 inside the manylinux_2_28 container.
 manylinux-x86_64-image = "manylinux_2_28"
-before-all = "dnf install -y gcc-toolset-14 epel-release && dnf install -y openblas-devel openblas-openmp swig && dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo && dnf install -y --setopt=obsoletes=0 cuda-toolkit-13-2 && /opt/python/cp311-cp311/bin/python -m pip install --target /opt/cuvs --no-deps --only-binary ':all:' --extra-index-url https://pypi.nvidia.com 'libcuvs-cu13==26.06.*' 'libraft-cu13==26.06.*' 'librmm-cu13==26.06.*' 'rapids-logger'"
+before-all = "dnf install -y gcc-toolset-14 epel-release && dnf install -y openblas-devel openblas-openmp openssl3-libs swig && dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo && dnf install -y --setopt=obsoletes=0 cuda-toolkit-13-2 && /opt/python/cp311-cp311/bin/python -m pip install --target /opt/cuvs --no-deps --only-binary ':all:' --extra-index-url https://pypi.nvidia.com 'libcuvs-cu13==26.06.*' 'libraft-cu13==26.06.*' 'librmm-cu13==26.06.*' 'rapids-logger'"
 # auditwheel excludes (not vendored; supplied at runtime by nvidia-* / libcuvs-cu13
 # wheels): host driver libcuda, CUDA runtime/math libs (cusparse/cusolver are explicit —
 # under the cuda-toolkit RPM, not /opt/cuvs), and every RAPIDS .so found under /opt/cuvs.

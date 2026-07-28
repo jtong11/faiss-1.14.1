@@ -108,7 +108,9 @@ test-command = "python -m pytest {project}/tests/test_wheel_smoke_gpu.py -v"
 manylinux-x86_64-image = "manylinux_2_28"
 # manylinux_2_28 ships gcc-toolset-14; CUDA 12.6 only supports GCC <=13, so install
 # gcc-toolset-13 explicitly and force the build to use it via CC/CXX/CUDAHOSTCXX below.
-before-all = "dnf install -y gcc-toolset-13 epel-release && dnf install -y openblas-devel openblas-openmp swig && dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo && dnf install -y --setopt=obsoletes=0 cuda-nvcc-12-6 cuda-cudart-devel-12-6 cuda-cccl-12-6 cuda-profiler-api-12-6 libcublas-devel-12-6 libcurand-devel-12-6"
+# openssl3-libs provides libssl.so.3 for Python/CUDA build tools linked against
+# OpenSSL 3 inside the manylinux_2_28 container.
+before-all = "dnf install -y gcc-toolset-13 epel-release && dnf install -y openblas-devel openblas-openmp openssl3-libs swig && dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo && dnf install -y --setopt=obsoletes=0 cuda-nvcc-12-6 cuda-cudart-devel-12-6 cuda-cccl-12-6 cuda-profiler-api-12-6 libcublas-devel-12-6 libcurand-devel-12-6"
 # auditwheel: exclude libcuda.so.1 (host driver, not pip-installable)
 # and the libcudart/libcublas* shipped via nvidia-*-cu12 wheels (preloaded at import time).
 repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel} --exclude libcudart.so.12 --exclude libcublas.so.12 --exclude libcublasLt.so.12 --exclude libcurand.so.10 --exclude libcuda.so.1"
