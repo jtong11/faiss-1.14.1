@@ -26,3 +26,11 @@ done in parallel on several machines
 (needs not to fit in RAM)
 
 6: load and test the index
+
+
+rust-hnswsq-avx2
+----------------
+
+Shows how to use Rust and Cargo to build an HNSW scalar-quantized index
+(`HNSW32,SQ8`) through the Faiss C API while statically linking the AVX2 Faiss
+libraries.
