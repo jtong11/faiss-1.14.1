@@ -32,5 +32,4 @@ rust-hnswsq-avx2
 ----------------
 
 Shows how to use Rust and Cargo to build an HNSW scalar-quantized index
-(`HNSW32,SQ8`) through the Faiss C API while statically linking the AVX2 Faiss
-libraries.
+(`HNSW32,SQ8`) through the Faiss C API as a fully static AVX2 Linux binary.
