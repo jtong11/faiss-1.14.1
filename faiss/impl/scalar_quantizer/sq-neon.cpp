@@ -734,7 +734,9 @@ InvertedListScanner* sq_select_InvertedListScanner<SIMDLevel::ARM_SVE>(
         const Index* quantizer,
         bool store_pairs,
         const IDSelector* sel,
-        bool by_residual) {
+        bool by_residual,
+        bool use_residual_norms,
+        size_t residual_norm_offset) {
     return sq_select_InvertedListScanner<SIMDLevel::ARM_NEON>(
             qtype,
             mt,
@@ -744,7 +746,9 @@ InvertedListScanner* sq_select_InvertedListScanner<SIMDLevel::ARM_SVE>(
             quantizer,
             store_pairs,
             sel,
-            by_residual);
+            by_residual,
+            use_residual_norms,
+            residual_norm_offset);
 }
 
 } // namespace scalar_quantizer

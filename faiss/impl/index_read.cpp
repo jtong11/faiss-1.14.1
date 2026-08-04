@@ -2126,24 +2126,42 @@ std::unique_ptr<Index> read_index_up(IOReader* f, int io_flags) {
         read_ivf_header(ivsc.get(), f, &ids);
         read_ScalarQuantizer(&ivsc->sq, f, *ivsc);
         READ1(ivsc->code_size);
+        ivsc->store_residual_norms = false;
         validate_code_size_match(
                 ivsc->code_size, ivsc->sq.code_size, "IndexIVFScalarQuantizer");
         ArrayInvertedLists* ail = set_array_invlist(ivsc.get(), ids);
         for (size_t i = 0; i < ivsc->nlist; i++)
             READVECTOR(ail->codes[i]);
         idx = std::move(ivsc);
-    } else if (h == fourcc("IwSQ") || h == fourcc("IwSq")) {
+    } else if (
+            h == fourcc("IwSQ") || h == fourcc("IwSq") ||
+            h == fourcc("IwSx")) {
         auto ivsc = std::make_unique<IndexIVFScalarQuantizer>();
         read_ivf_header(ivsc.get(), f);
         read_ScalarQuantizer(&ivsc->sq, f, *ivsc);
         READ1(ivsc->code_size);
-        validate_code_size_match(
-                ivsc->code_size, ivsc->sq.code_size, "IndexIVFScalarQuantizer");
         if (h == fourcc("IwSQ")) {
             ivsc->by_residual = true;
         } else {
             READ1_BOOL(ivsc->by_residual);
         }
+        if (h == fourcc("IwSx")) {
+            READ1_BOOL(ivsc->store_residual_norms);
+        } else {
+            ivsc->store_residual_norms = false;
+        }
+        if (ivsc->store_residual_norms) {
+            FAISS_THROW_IF_NOT_MSG(
+                    ivsc->sq.qtype == ScalarQuantizer::QT_8bit &&
+                            ivsc->metric_type == METRIC_L2 &&
+                            ivsc->by_residual,
+                    "IndexIVFScalarQuantizer residual norms require SQ8, L2, and by_residual");
+        }
+        validate_code_size_match(
+                ivsc->code_size,
+                ivsc->sq.code_size +
+                        (ivsc->store_residual_norms ? sizeof(float) : 0),
+                "IndexIVFScalarQuantizer");
         read_InvertedLists(*ivsc, f, io_flags);
         idx = std::move(ivsc);
     } else if (

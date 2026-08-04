@@ -254,6 +254,7 @@ void GpuIndexIVFScalarQuantizer::copyTo(
     }
 #endif
     index->sq = sqCopy;
+    index->store_residual_norms = false;
     index->code_size = sqCopy.code_size;
     index->by_residual = by_residual;
 

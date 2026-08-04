@@ -702,19 +702,27 @@ InvertedListScanner* ScalarQuantizer::select_InvertedListScanner(
         const Index* quantizer,
         bool store_pairs,
         const IDSelector* sel,
-        bool by_residual) const {
+        bool by_residual,
+        size_t index_code_size,
+        bool use_residual_norms,
+        size_t residual_norm_offset) const {
+    if (index_code_size == 0) {
+        index_code_size = code_size;
+    }
     return with_simd_level_spr([&]<SIMDLevel SL>() -> InvertedListScanner* {
         if constexpr (SL != SIMDLevel::NONE) {
             auto* s = scalar_quantizer::sq_select_InvertedListScanner<SL>(
                     qtype,
                     mt,
                     d,
-                    code_size,
+                    index_code_size,
                     trained,
                     quantizer,
                     store_pairs,
                     sel,
-                    by_residual);
+                    by_residual,
+                    use_residual_norms,
+                    residual_norm_offset);
             if (s) {
                 return s;
             }
@@ -723,12 +731,14 @@ InvertedListScanner* ScalarQuantizer::select_InvertedListScanner(
                 qtype,
                 mt,
                 d,
-                code_size,
+                index_code_size,
                 trained,
                 quantizer,
                 store_pairs,
                 sel,
-                by_residual);
+                by_residual,
+                use_residual_norms,
+                residual_norm_offset);
     });
 }
 

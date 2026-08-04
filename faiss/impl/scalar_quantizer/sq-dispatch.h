@@ -651,7 +651,9 @@ InvertedListScanner* sq_select_InvertedListScanner<THE_LEVEL_TO_DISPATCH>(
         const Index* quantizer,
         bool store_pairs,
         const IDSelector* sel,
-        bool by_residual) {
+        bool by_residual,
+        bool use_residual_norms,
+        size_t residual_norm_offset) {
     auto scan = [&]<class DCClass>() -> InvertedListScanner* {
         if constexpr (DCClass::Sim::metric_type == METRIC_L2) {
             return new IVFSQScannerL2<DCClass>(
@@ -661,7 +663,9 @@ InvertedListScanner* sq_select_InvertedListScanner<THE_LEVEL_TO_DISPATCH>(
                     quantizer,
                     store_pairs,
                     sel,
-                    by_residual);
+                    by_residual,
+                    use_residual_norms,
+                    residual_norm_offset);
         } else if constexpr (
                 DCClass::Sim::metric_type == METRIC_INNER_PRODUCT) {
             return new IVFSQScannerIP<DCClass>(

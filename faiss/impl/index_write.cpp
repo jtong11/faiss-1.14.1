@@ -759,12 +759,15 @@ void write_index(const Index* idx, IOWriter* f, int io_flags) {
     } else if (
             const IndexIVFScalarQuantizer* ivsc =
                     dynamic_cast<const IndexIVFScalarQuantizer*>(idx)) {
-        uint32_t h = fourcc("IwSq");
+        uint32_t h = fourcc(ivsc->store_residual_norms ? "IwSx" : "IwSq");
         WRITE1(h);
         write_ivf_header(ivsc, f);
         write_ScalarQuantizer(&ivsc->sq, f);
         WRITE1(ivsc->code_size);
         WRITE1(ivsc->by_residual);
+        if (ivsc->store_residual_norms) {
+            WRITE1(ivsc->store_residual_norms);
+        }
         write_InvertedLists(ivsc->invlists, f);
     } else if (auto iva = dynamic_cast<const IndexIVFAdditiveQuantizer*>(idx)) {
         bool is_LSQ = dynamic_cast<const IndexIVFLocalSearchQuantizer*>(iva);

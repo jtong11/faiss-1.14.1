@@ -76,6 +76,9 @@ struct IVFSQTurboQSearchParameters : IVFSearchParameters {
 struct IndexIVFScalarQuantizer : IndexIVF {
     ScalarQuantizer sq;
 
+    /// Append ||x - centroid||^2 after each SQ code for residual L2 search.
+    bool store_residual_norms = false;
+
     IndexIVFScalarQuantizer(
             Index* quantizer,
             size_t d,
@@ -90,6 +93,12 @@ struct IndexIVFScalarQuantizer : IndexIVF {
     void train_encoder(idx_t n, const float* x, const idx_t* assign) override;
 
     idx_t train_encoder_num_vectors() const override;
+
+    /// Recompute code_size from the scalar code and optional residual norm.
+    void update_code_size();
+
+    /// Enable or disable residual-norm storage before adding vectors.
+    void set_store_residual_norms(bool store);
 
     void encode_vectors(
             idx_t n,

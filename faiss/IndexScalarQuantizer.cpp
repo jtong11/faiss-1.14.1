@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 
 #include <omp.h>
 
@@ -20,9 +21,18 @@
 #include <faiss/impl/FaissAssert.h>
 #include <faiss/impl/IDSelector.h>
 #include <faiss/impl/ScalarQuantizer.h>
+#include <faiss/utils/distances.h>
 #include <faiss/utils/utils.h>
 
 namespace faiss {
+
+namespace {
+
+void store_residual_norm(float norm, uint8_t* code, size_t offset) {
+    std::memcpy(code + offset, &norm, sizeof(norm));
+}
+
+} // namespace
 
 /*******************************************************************
  * IndexScalarQuantizer implementation
@@ -129,8 +139,9 @@ IndexIVFScalarQuantizer::IndexIVFScalarQuantizer(
         bool own_invlists_)
         : IndexIVF(quantizer_, d_, nlist_, 0, metric, own_invlists_),
           sq(d_, qtype) {
-    code_size = sq.code_size;
     this->by_residual = by_residual_;
+    store_residual_norms = false;
+    update_code_size();
     if (invlists) {
         // was not known at construction time
         invlists->code_size = code_size;
@@ -138,10 +149,14 @@ IndexIVFScalarQuantizer::IndexIVFScalarQuantizer(
     is_trained = false;
     if (qtype == ScalarQuantizer::QT_0bit) {
         by_residual = false;
+        store_residual_norms = false;
+        update_code_size();
         is_trained = true; // no training needed
     }
     if (ScalarQuantizer::TurboQuantRefine::is_turboq_full(qtype)) {
         by_residual = false;
+        store_residual_norms = false;
+        update_code_size();
     }
 }
 
@@ -158,6 +173,27 @@ void IndexIVFScalarQuantizer::train_encoder(
 
 idx_t IndexIVFScalarQuantizer::train_encoder_num_vectors() const {
     return 100000;
+}
+
+void IndexIVFScalarQuantizer::update_code_size() {
+    code_size = sq.code_size + (store_residual_norms ? sizeof(float) : 0);
+    if (invlists) {
+        invlists->code_size = code_size;
+    }
+}
+
+void IndexIVFScalarQuantizer::set_store_residual_norms(bool store) {
+    FAISS_THROW_IF_NOT_MSG(
+            ntotal == 0,
+            "residual norm storage must be configured before adding vectors");
+    if (store) {
+        FAISS_THROW_IF_NOT_MSG(
+                sq.qtype == ScalarQuantizer::QT_8bit &&
+                        metric_type == METRIC_L2 && by_residual,
+                "residual norm storage requires SQ8, L2, and by_residual");
+    }
+    store_residual_norms = store;
+    update_code_size();
 }
 
 void IndexIVFScalarQuantizer::encode_vectors(
@@ -195,6 +231,12 @@ void IndexIVFScalarQuantizer::encode_vectors(
                 uint8_t* code = codes + i * (code_size + coarse_size);
                 if (by_residual) {
                     quantizer->compute_residual(xi, residual.data(), list_no);
+                    if (store_residual_norms) {
+                        const float norm =
+                                fvec_norm_L2sqr(residual.data(), d);
+                        store_residual_norm(
+                                norm, code + coarse_size, sq.code_size);
+                    }
                     xi = residual.data();
                 }
                 if (coarse_size) {
@@ -219,7 +261,16 @@ void IndexIVFScalarQuantizer::decode_vectors(
         return;
     }
     FAISS_THROW_IF_NOT(is_trained);
-    sq.decode(codes, x, n);
+    if (code_size == sq.code_size) {
+        sq.decode(codes, x, n);
+    } else {
+        std::unique_ptr<ScalarQuantizer::SQuantizer> squant(
+                sq.select_quantizer());
+#pragma omp parallel for if (n > 1000)
+        for (idx_t i = 0; i < n; i++) {
+            squant->decode_vector(codes + i * code_size, x + i * d);
+        }
+    }
     if (by_residual) {
         FAISS_THROW_IF_NOT_MSG(
                 list_nos, "decode_vectors with by_residual requires list_nos");
@@ -318,6 +369,10 @@ void IndexIVFScalarQuantizer::add_core(
 
                 memset(one_code.data(), 0, code_size);
                 squant->encode_vector(xi, one_code.data());
+                if (by_residual && store_residual_norms) {
+                    const float norm = fvec_norm_L2sqr(residual.data(), d);
+                    store_residual_norm(norm, one_code.data(), sq.code_size);
+                }
 
                 size_t ofs = invlists->add_entry(
                         list_no, id, one_code.data(), inverted_list_context);
@@ -339,7 +394,15 @@ InvertedListScanner* IndexIVFScalarQuantizer::get_InvertedListScanner(
         const IVFSearchParameters* search_params) const {
     if (!ScalarQuantizer::TurboQuantRefine::is_turboq_full(sq.qtype)) {
         return sq.select_InvertedListScanner(
-                metric_type, quantizer, store_pairs, sel, by_residual);
+                metric_type,
+                quantizer,
+                store_pairs,
+                sel,
+                by_residual,
+                code_size,
+                store_residual_norms && by_residual &&
+                        metric_type == METRIC_L2,
+                sq.code_size);
     }
 
     // TurboQ full types: create a TQ-specific scanner that supports

@@ -22,6 +22,7 @@
 #include <faiss/impl/scalar_quantizer/quantizers.h>
 #include <faiss/impl/scalar_quantizer/scanners.h>
 #include <faiss/impl/scalar_quantizer/similarities.h>
+#include <faiss/invlists/InvertedLists.h>
 #include <faiss/index_factory.h>
 #include <faiss/utils/distances.h>
 #include <faiss/utils/random.h>
@@ -411,6 +412,80 @@ TEST(ScalarQuantizer, MinimalTraining) {
             // 1x1 values is allowed.
             EXPECT_NO_THROW(index.train(1, x.data()));
         }
+    }
+}
+
+TEST(TestIVFSQ8ResidualNorms, StoresAndUsesCentroidDistance) {
+    constexpr int d = 8;
+    constexpr int nlist = 4;
+    constexpr int nb = 80;
+
+    std::mt19937 rng(123);
+    std::uniform_real_distribution<float> distrib(-1.0f, 1.0f);
+    std::vector<float> xb(nb * d), xq(d);
+    for (float& v : xb) {
+        v = distrib(rng);
+    }
+    for (float& v : xq) {
+        v = distrib(rng);
+    }
+
+    faiss::IndexFlatL2 quantizer(d);
+    faiss::IndexIVFScalarQuantizer index(
+            &quantizer,
+            d,
+            nlist,
+            faiss::ScalarQuantizer::QT_8bit,
+            faiss::METRIC_L2,
+            true);
+    index.set_store_residual_norms(true);
+    EXPECT_EQ(index.code_size, index.sq.code_size + sizeof(float));
+
+    index.train(nb, xb.data());
+    index.add(nb, xb.data());
+    index.nprobe = nlist;
+
+    std::vector<float> expected(nb, -1.0f);
+    std::vector<float> centroid(d);
+    std::vector<float> q_residual(d);
+    std::vector<float> decoded_residual(d);
+
+    for (int list_no = 0; list_no < nlist; list_no++) {
+        const size_t list_size = index.invlists->list_size(list_no);
+        faiss::InvertedLists::ScopedCodes codes(index.invlists, list_no);
+        faiss::InvertedLists::ScopedIds ids(index.invlists, list_no);
+
+        quantizer.reconstruct(list_no, centroid.data());
+        quantizer.compute_residual(xq.data(), q_residual.data(), list_no);
+
+        for (size_t offset = 0; offset < list_size; offset++) {
+            const uint8_t* code = codes.get() + offset * index.code_size;
+            float stored_norm = 0;
+            std::memcpy(
+                    &stored_norm, code + index.sq.code_size, sizeof(float));
+
+            const faiss::idx_t id = ids[offset];
+            const float* xi = xb.data() + id * d;
+            const float exact_norm =
+                    faiss::fvec_L2sqr(xi, centroid.data(), d);
+            EXPECT_NEAR(stored_norm, exact_norm, 1e-5);
+
+            index.sq.decode(code, decoded_residual.data(), 1);
+            const float decoded_distance = faiss::fvec_L2sqr(
+                    q_residual.data(), decoded_residual.data(), d);
+            const float decoded_norm =
+                    faiss::fvec_norm_L2sqr(decoded_residual.data(), d);
+            expected[id] = decoded_distance + stored_norm - decoded_norm;
+        }
+    }
+
+    std::vector<float> distances(nb);
+    std::vector<faiss::idx_t> labels(nb);
+    index.search(1, xq.data(), nb, distances.data(), labels.data());
+
+    for (int i = 0; i < nb; i++) {
+        ASSERT_GE(labels[i], 0);
+        EXPECT_NEAR(distances[i], expected[labels[i]], 1e-4);
     }
 }
 

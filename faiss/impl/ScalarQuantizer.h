@@ -209,7 +209,10 @@ struct ScalarQuantizer : Quantizer {
             const Index* quantizer,
             bool store_pairs,
             const IDSelector* sel,
-            bool by_residual = false) const;
+            bool by_residual = false,
+            size_t code_size = 0,
+            bool use_residual_norms = false,
+            size_t residual_norm_offset = 0) const;
 };
 
 } // namespace faiss

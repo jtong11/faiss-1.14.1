@@ -1738,6 +1738,7 @@ class IndexIVFScalarQuantizer(IndexIVF):
     sq: ScalarQuantizer
     code_size: int
     by_residual: bool
+    store_residual_norms: bool
 
     def __init__(
         self,
@@ -1748,6 +1749,8 @@ class IndexIVFScalarQuantizer(IndexIVF):
         metric: MetricType = METRIC_L2,
         encode_residual: bool = True,
     ) -> None: ...
+    def update_code_size(self) -> None: ...
+    def set_store_residual_norms(self, store: bool) -> None: ...
 
 # IVF FastScan base class
 class IndexIVFFastScan(IndexIVF):

@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include <cstring>
+
 #include <faiss/impl/ScalarQuantizer.h>
 #include <faiss/impl/simdlib/simdlib_dispatch.h>
 #include <faiss/utils/simd_levels.h>
@@ -34,6 +36,23 @@ namespace scalar_quantizer {
 
 using QuantizerType = ScalarQuantizer::QuantizerType;
 using SQDistanceComputer = ScalarQuantizer::SQDistanceComputer;
+
+template <class DCClass>
+float reconstructed_l2sqr(const DCClass& dc, const uint8_t* code) {
+    if constexpr (requires(const DCClass& dc0, const uint8_t* code0, size_t i) {
+                      dc0.quant.d;
+                      dc0.quant.reconstruct_component(code0, i);
+                  }) {
+        float norm = 0;
+        for (size_t i = 0; i < dc.quant.d; i++) {
+            const float xi = dc.quant.reconstruct_component(code, i);
+            norm += xi * xi;
+        }
+        return norm;
+    } else {
+        FAISS_THROW_MSG("residual norm correction is unsupported");
+    }
+}
 
 /*******************************************************************
  * IVFSQScannerIP / IVFSQScannerL2 — moved from anonymous namespace
@@ -91,6 +110,8 @@ struct IVFSQScannerL2 : InvertedListScanner {
     bool by_residual;
     const Index* quantizer;
     const float* x; /// current query
+    bool use_residual_norms;
+    size_t residual_norm_offset;
 
     std::vector<float> tmp;
 
@@ -101,11 +122,15 @@ struct IVFSQScannerL2 : InvertedListScanner {
             const Index* quantizer,
             bool store_pairs,
             const IDSelector* sel,
-            bool by_residual)
+            bool by_residual,
+            bool use_residual_norms = false,
+            size_t residual_norm_offset = 0)
             : dc(d, trained),
               by_residual(by_residual),
               quantizer(quantizer),
               x(nullptr),
+              use_residual_norms(use_residual_norms),
+              residual_norm_offset(residual_norm_offset),
               tmp(d) {
         this->store_pairs = store_pairs;
         this->sel = sel;
@@ -130,7 +155,15 @@ struct IVFSQScannerL2 : InvertedListScanner {
     }
 
     float distance_to_code(const uint8_t* code) const final {
-        return dc.query_to_code(code);
+        const float dis = dc.query_to_code(code);
+        if (!use_residual_norms) {
+            return dis;
+        }
+
+        float stored_norm = 0;
+        std::memcpy(
+                &stored_norm, code + residual_norm_offset, sizeof(stored_norm));
+        return dis + stored_norm - reconstructed_l2sqr(dc, code);
     }
 
     size_t scan_codes(
@@ -157,7 +190,9 @@ InvertedListScanner* sq_select_InvertedListScanner(
         const Index* quantizer,
         bool store_pairs,
         const IDSelector* sel,
-        bool by_residual);
+        bool by_residual,
+        bool use_residual_norms = false,
+        size_t residual_norm_offset = 0);
 
 /// Scanner for QT_0bit / centroid-only distance: always returns the
 /// coarse distance that was set via set_list().
