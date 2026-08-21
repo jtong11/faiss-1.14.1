@@ -8,12 +8,11 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
-#include <cstring>
 #include <random>
 #include <vector>
 
 #include <faiss/IndexFlat.h>
-#include <faiss/IndexIVFFlat.h>
+#include <faiss/IndexScalarQuantizer.h>
 #include <faiss/invlists/InvertedLists.h>
 
 float squared_l2(const float* x, const float* y, int d) {
@@ -42,7 +41,8 @@ int main() {
     }
 
     faiss::IndexFlatL2 quantizer(d);
-    faiss::IndexIVFFlat index(&quantizer, d, nlist);
+    faiss::IndexIVFScalarQuantizer index(
+            &quantizer, d, nlist, faiss::ScalarQuantizer::QT_8bit);
     index.train(nb, xb.data());
     index.add(nb, xb.data());
 
@@ -65,10 +65,6 @@ int main() {
 
     const faiss::InvertedLists* invlists = index.invlists;
     faiss::InvertedLists::ScopedIds ids(invlists, list_no);
-    faiss::InvertedLists::ScopedCodes codes(invlists, list_no);
-
-    // For IndexIVFFlat, each inverted-list code is the raw float32 vector.
-    assert(index.code_size == d * sizeof(float));
 
     printf("IVF list %zu contains %zu vectors\n", list_no, list_size);
     printf("first 10 distances from the list centroid:\n");
@@ -76,10 +72,9 @@ int main() {
     const size_t nprint = std::min<size_t>(10, list_size);
     std::vector<float> list_vector(d);
     for (size_t offset = 0; offset < nprint; offset++) {
-        std::memcpy(
-                list_vector.data(),
-                codes.get() + offset * index.code_size,
-                index.code_size);
+        // IVF-SQ8 stores quantized residual codes. Reconstruct the approximate
+        // vector for this list entry before comparing it to the centroid.
+        index.reconstruct_from_offset(list_no, offset, list_vector.data());
         const float distance =
                 squared_l2(list_vector.data(), centroid.data(), d);
         printf("id=%5zd squared_L2_to_centroid=%f\n", ids[offset], distance);
