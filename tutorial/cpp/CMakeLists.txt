@@ -40,3 +40,6 @@ if(FAISS_ENABLE_SVS)
   target_link_libraries(11-SVS-Vamana-LeanVec PRIVATE faiss)
   target_compile_definitions(11-SVS-Vamana-LeanVec PRIVATE FAISS_ENABLE_SVS FAISS_SVS_RUNTIME_VERSION=${FAISS_SVS_RUNTIME_VERSION})
 endif()
+
+add_executable(12-IVF-list-distance EXCLUDE_FROM_ALL 12-IVF-list-distance.cpp)
+target_link_libraries(12-IVF-list-distance PRIVATE faiss)
