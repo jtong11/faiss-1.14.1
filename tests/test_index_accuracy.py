@@ -154,6 +154,22 @@ class IndexAccuracy(unittest.TestCase):
         # should give 0.234  0.236  0.236
         assert e[10] > 0.235
 
+    def test_ivf_scalar_quantizer_get_trained_info(self):
+        d2 = 16
+        xt = np.random.RandomState(123).random_sample((512, d2)).astype("float32")
+        index = faiss.IndexIVFScalarQuantizer(
+            faiss.IndexFlatL2(d2), d2, 8, faiss.ScalarQuantizer.QT_8bit
+        )
+
+        assert faiss.vector_to_array(index.get_trained_info()).size == 0
+
+        index.train(xt)
+
+        trained_info = faiss.vector_to_array(index.get_trained_info())
+        sq_trained = faiss.vector_to_array(index.sq.trained)
+        np.testing.assert_array_equal(trained_info, sq_trained)
+        assert trained_info.size == 2 * d2
+
     def test_polysemous_OOM(self):
         """this used to cause OOM when training polysemous with large
         nb bits"""

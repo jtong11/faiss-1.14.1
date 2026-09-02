@@ -145,6 +145,10 @@ void IndexIVFScalarQuantizer::train_encoder(
     sq.train(n, x);
 }
 
+const std::vector<float>& IndexIVFScalarQuantizer::get_trained_info() const {
+    return sq.trained;
+}
+
 idx_t IndexIVFScalarQuantizer::train_encoder_num_vectors() const {
     return 100000;
 }

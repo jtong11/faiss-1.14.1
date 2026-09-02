@@ -1649,6 +1649,7 @@ class IndexIVFScalarQuantizer(IndexIVF):
         metric: MetricType = METRIC_L2,
         encode_residual: bool = True,
     ) -> None: ...
+    def get_trained_info(self) -> Float32Vector: ...
 
 # IVF FastScan base class
 class IndexIVFFastScan(IndexIVF):
