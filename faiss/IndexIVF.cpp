@@ -1249,6 +1249,11 @@ void IndexIVF::train_encoder(
     }
 }
 
+const std::vector<float>& IndexIVF::get_trained_info() const {
+    static const std::vector<float> empty_trained_info;
+    return empty_trained_info;
+}
+
 bool check_compatible_for_merge_expensive_check = true;
 
 void IndexIVF::check_compatible_for_merge(const Index& otherIndex) const {

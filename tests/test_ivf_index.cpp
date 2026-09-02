@@ -16,9 +16,37 @@
 
 #include <faiss/IndexFlat.h>
 #include <faiss/IndexIVFFlat.h>
+#include <faiss/IndexScalarQuantizer.h>
 #include <faiss/impl/FaissAssert.h>
 
 namespace {
+
+TEST(IndexIVF, TrainedInfoDefaultsEmpty) {
+    faiss::IndexFlatL2 quantizer(4);
+    faiss::IndexIVFFlat index(&quantizer, 4, 2);
+
+    const faiss::IndexIVF& ivf = index;
+    EXPECT_TRUE(ivf.get_trained_info().empty());
+}
+
+TEST(IndexIVFScalarQuantizer, GetTrainedInfoThroughIndexIVF) {
+    constexpr int d = 4;
+    constexpr int n = 8;
+    std::vector<float> x(d * n);
+    for (size_t i = 0; i < x.size(); i++) {
+        x[i] = static_cast<float>(i);
+    }
+
+    faiss::IndexFlatL2 quantizer(d);
+    faiss::IndexIVFScalarQuantizer index(
+            &quantizer, d, 2, faiss::ScalarQuantizer::QT_8bit);
+    index.train_encoder(n, x.data(), nullptr);
+
+    const faiss::IndexIVF& ivf = index;
+    const std::vector<float>& trained_info = ivf.get_trained_info();
+    EXPECT_EQ(trained_info.size(), 2 * d);
+    EXPECT_EQ(trained_info.data(), index.sq.trained.data());
+}
 
 // stores all ivf lists, used to verify the context
 // object is passed to the iterator

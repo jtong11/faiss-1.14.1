@@ -11,6 +11,7 @@
 #define FAISS_INDEX_IVF_H
 
 #include <stdint.h>
+#include <vector>
 
 #include <faiss/Clustering.h>
 #include <faiss/Index.h>
@@ -278,6 +279,9 @@ struct IndexIVF : Index, IndexIVFInterface {
      * If by_residual then it is called with residuals and corresponding assign
      * array, otherwise x is the raw training vectors and assign=nullptr */
     virtual void train_encoder(idx_t n, const float* x, const idx_t* assign);
+
+    /// Return codec-specific trained values when available.
+    virtual const std::vector<float>& get_trained_info() const;
 
     /// can be redefined by subclasses to indicate how many training vectors
     /// they need

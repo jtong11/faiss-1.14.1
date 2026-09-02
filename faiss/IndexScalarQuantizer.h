@@ -80,7 +80,7 @@ struct IndexIVFScalarQuantizer : IndexIVF {
     void train_encoder(idx_t n, const float* x, const idx_t* assign) override;
 
     /// Return the scalar quantizer trained values.
-    const std::vector<float>& get_trained_info() const;
+    const std::vector<float>& get_trained_info() const override;
 
     idx_t train_encoder_num_vectors() const override;
 
