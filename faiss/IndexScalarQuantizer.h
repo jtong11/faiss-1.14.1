@@ -66,6 +66,10 @@ struct IndexScalarQuantizer : IndexFlatCodes {
 struct IndexIVFScalarQuantizer : IndexIVF {
     ScalarQuantizer sq;
 
+    /// Maximum number of vectors used to train the scalar quantizer. Set to 0
+    /// or a negative value to disable subsampling.
+    idx_t max_train_points = 100000;
+
     IndexIVFScalarQuantizer(
             Index* quantizer,
             size_t d,

@@ -1639,6 +1639,7 @@ class IndexIVFScalarQuantizer(IndexIVF):
     sq: ScalarQuantizer
     code_size: int
     by_residual: bool
+    max_train_points: int
 
     def __init__(
         self,

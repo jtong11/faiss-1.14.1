@@ -146,7 +146,7 @@ void IndexIVFScalarQuantizer::train_encoder(
 }
 
 idx_t IndexIVFScalarQuantizer::train_encoder_num_vectors() const {
-    return 100000;
+    return max_train_points;
 }
 
 void IndexIVFScalarQuantizer::encode_vectors(
