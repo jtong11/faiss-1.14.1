@@ -345,6 +345,28 @@ class TestMultiIndexQuantizer(unittest.TestCase):
 
 class TestScalarQuantizer(unittest.TestCase):
 
+    def test_ivfsq_max_train_points(self):
+        d = 16
+        nlist = 8
+        quantizer = faiss.IndexFlatL2(d)
+        index = faiss.IndexIVFScalarQuantizer(
+            quantizer, d, nlist, faiss.ScalarQuantizer.QT_8bit
+        )
+
+        self.assertEqual(index.max_train_points, 100000)
+        self.assertEqual(index.train_encoder_num_vectors(), 100000)
+
+        index.max_train_points = 250000
+        self.assertEqual(index.train_encoder_num_vectors(), 250000)
+
+        index.max_train_points = 0
+        self.assertEqual(index.train_encoder_num_vectors(), 0)
+
+        factory_base_index = faiss.index_factory(d, "IVF8,SQ8")
+        factory_index = faiss.downcast_index(factory_base_index)
+        factory_index.max_train_points = 500000
+        self.assertEqual(factory_index.train_encoder_num_vectors(), 500000)
+
     def test_4variants_ivf(self):
         d = 32
         nt = 2500
