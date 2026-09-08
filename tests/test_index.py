@@ -359,9 +359,8 @@ class TestScalarQuantizer(unittest.TestCase):
         index.max_train_points = 250000
         self.assertEqual(index.train_encoder_num_vectors(), 250000)
 
-        factory_index = faiss.downcast_index(
-            faiss.index_factory(d, "IVF8,SQ8")
-        )
+        factory_base_index = faiss.index_factory(d, "IVF8,SQ8")
+        factory_index = faiss.downcast_index(factory_base_index)
         factory_index.max_train_points = 500000
         self.assertEqual(factory_index.train_encoder_num_vectors(), 500000)
 
