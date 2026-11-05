@@ -336,6 +336,21 @@ struct IndexIVF : Index, IndexIVFInterface {
             idx_t* labels,
             const SearchParameters* params = nullptr) const override;
 
+    /** Search one query over externally filtered IVF lists.
+     *
+     * keys is terminated by -1 or nlist entries. lens and label_lists describe
+     * the filtered labels for the selected lists; label -1 entries are skipped.
+     */
+    virtual void search_with_filter(
+            const float* x,
+            idx_t k,
+            idx_t* keys,
+            float* coarse_diss,
+            idx_t* lens,
+            idx_t* label_lists,
+            idx_t* labels,
+            float* distances) const;
+
     void range_search(
             idx_t n,
             const float* x,
