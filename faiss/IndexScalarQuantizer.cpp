@@ -10,7 +10,13 @@
 #include <faiss/IndexScalarQuantizer.h>
 
 #include <algorithm>
+#include <cinttypes>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <limits>
+#include <memory>
+#include <vector>
 
 #include <omp.h>
 
@@ -23,6 +29,96 @@
 #include <faiss/utils/utils.h>
 
 namespace faiss {
+
+namespace {
+
+struct SQ8IPIntegerPreselector {
+    bool enabled = false;
+    bool by_residual = false;
+    int dim = 0;
+    float query_base = 0;
+    float list_base = 0;
+    float int_to_score = 0;
+    float error_bound = 0;
+    std::vector<int16_t> int_weights;
+
+    void prepare(
+            const ScalarQuantizer& sq,
+            const float* query,
+            bool by_residual_in) {
+        enabled = false;
+        by_residual = by_residual_in;
+        dim = static_cast<int>(sq.d);
+        query_base = 0;
+        list_base = 0;
+        int_to_score = 0;
+        error_bound = 0;
+        int_weights.clear();
+
+        if (sq.qtype != ScalarQuantizer::QT_8bit &&
+            sq.qtype != ScalarQuantizer::QT_8bit_uniform) {
+            return;
+        }
+
+        const bool uniform = sq.qtype == ScalarQuantizer::QT_8bit_uniform;
+        std::vector<float> weights(dim);
+        float max_abs_weight = 0;
+        double base = 0;
+
+        for (int i = 0; i < dim; i++) {
+            const float vmin = uniform ? sq.trained[0] : sq.trained[i];
+            const float vdiff = uniform ? sq.trained[1] : sq.trained[dim + i];
+            const float weight = query[i] * vdiff;
+            weights[i] = weight;
+            base += query[i] * vmin + weight * (0.5 / 255.0);
+            max_abs_weight = std::max(max_abs_weight, std::abs(weight));
+        }
+
+        query_base = static_cast<float>(base);
+        int_weights.assign(dim, 0);
+        enabled = true;
+
+        if (max_abs_weight == 0) {
+            return;
+        }
+
+        const double scale = 32767.0 / max_abs_weight;
+        int_to_score = static_cast<float>(1.0 / (scale * 255.0));
+
+        double err = 0;
+        for (int i = 0; i < dim; i++) {
+            long long wi = std::llround(weights[i] * scale);
+            wi = std::max<long long>(-32767, std::min<long long>(32767, wi));
+            int_weights[i] = static_cast<int16_t>(wi);
+            err += std::abs(weights[i] - static_cast<float>(wi / scale));
+        }
+        error_bound = static_cast<float>(err);
+    }
+
+    void set_list(float coarse_dis) {
+        list_base = query_base + (by_residual ? coarse_dis : 0);
+    }
+
+    bool may_exceed(float threshold, const uint8_t* code) const {
+        if (!enabled) {
+            return true;
+        }
+
+        int64_t int_score = 0;
+        for (int i = 0; i < dim; i++) {
+            int_score += static_cast<int64_t>(int_weights[i]) * code[i];
+        }
+
+        const float approx_score = int_score * int_to_score;
+        const float upper_bound = list_base + approx_score + error_bound;
+        const float margin =
+                1e-5f * (std::abs(list_base) + std::abs(approx_score) +
+                          error_bound + 1.0f);
+        return upper_bound + margin > threshold;
+    }
+};
+
+} // namespace
 
 /*******************************************************************
  * IndexScalarQuantizer implementation
@@ -395,6 +491,187 @@ InvertedListScanner* IndexIVFScalarQuantizer::get_InvertedListScanner(
             dc, store_pairs, sel, is_similarity_metric(metric_type));
     scanner->code_size = code_size;
     return scanner;
+}
+
+void IndexIVFScalarQuantizer::search_with_filter(
+        const float* x,
+        idx_t k,
+        idx_t* keys,
+        float* coarse_diss,
+        idx_t* lens,
+        idx_t* label_lists,
+        idx_t* labels,
+        float* distances) const {
+    if (metric_type != METRIC_INNER_PRODUCT ||
+        (sq.qtype != ScalarQuantizer::QT_8bit &&
+         sq.qtype != ScalarQuantizer::QT_8bit_uniform)) {
+        IndexIVF::search_with_filter(
+                x, k, keys, coarse_diss, lens, label_lists, labels, distances);
+        return;
+    }
+
+    FAISS_THROW_IF_NOT(k > 0);
+
+    idx_t nkeys = 0;
+    while (nkeys < static_cast<idx_t>(nlist) && keys[nkeys] >= 0) {
+        FAISS_THROW_IF_NOT_FMT(
+                keys[nkeys] < static_cast<idx_t>(nlist),
+                "Invalid key=%" PRId64 " nlist=%zd\n",
+                keys[nkeys],
+                nlist);
+        nkeys += 1;
+    }
+
+    invlists->prefetch_lists(keys, static_cast<int>(nkeys));
+
+    size_t nlistv = 0, ndis = 0, nheap = 0;
+    float min_score = std::max(0.01f, distances[0]);
+    float max_score = min_score;
+
+    double t0 = getmillisecs();
+
+    std::unique_ptr<InvertedListScanner> scanner(
+            get_InvertedListScanner(false, nullptr, nullptr));
+    scanner->set_query(x);
+
+    SQ8IPIntegerPreselector preselector;
+    preselector.prepare(sq, x, by_residual);
+
+    using HeapForIP = CMin<float, idx_t>;
+    heap_heapify<HeapForIP>(k, distances, labels);
+
+    int pred = 0;
+    int full = 0;
+    int hit = 0;
+    std::vector<int> hits(nkeys);
+    int miss_centroid = 0;
+    int stop_i = -1;
+    bool collect_drops = false;
+    std::vector<float> drops;
+
+    for (idx_t i = 0; i < nkeys; i++) {
+        scanner->set_list(keys[i], coarse_diss[i]);
+        preselector.set_list(coarse_diss[i]);
+        nlistv++;
+
+        try {
+            InvertedLists::ScopedCodes scodes(invlists, keys[i]);
+
+            const uint8_t* codes = scodes.get();
+            const size_t scanner_code_size = scanner->code_size;
+
+            if (scanner_code_size > 0) {
+                hits[i] = 0;
+                for (idx_t n = 0; n < lens[i]; n++) {
+                    const idx_t label = label_lists[ndis + n];
+                    if (label == -1) {
+                        codes += scanner_code_size;
+                        continue;
+                    }
+
+                    pred++;
+
+                    const float threshold = std::max(min_score, distances[0]);
+                    if (!preselector.may_exceed(threshold, codes)) {
+                        codes += scanner_code_size;
+                        continue;
+                    }
+
+                    const float accu = scanner->distance_to_code(codes);
+                    full++;
+
+                    if (accu > min_score && accu > distances[0]) {
+                        heap_replace_top<HeapForIP>(
+                                k, distances, labels, accu, label);
+                        nheap++;
+
+                        min_score = std::max(min_score, distances[0]);
+                        max_score = std::max(max_score, accu);
+                        hit++;
+                        hits[i]++;
+
+                        if (collect_drops) {
+                            drops.push_back(accu);
+                        }
+                    }
+
+                    codes += scanner_code_size;
+                }
+
+                float hit_ratio = 1000 * hits[i] / static_cast<float>(lens[i]);
+                if (hit_ratio < 1.0) {
+                    miss_centroid++;
+                }
+
+                if (nkeys < nlist) {
+                    if (coarse_diss[i] < min_score * 0.9 &&
+                        miss_centroid >
+                                std::max(200, static_cast<int>(nkeys)) *
+                                        0.382) {
+                        if (!collect_drops) {
+                            collect_drops = true;
+                            stop_i = i;
+                        }
+
+                        break;
+                    }
+                }
+            } else {
+                nheap += scanner->scan_codes(
+                        lens[i],
+                        scodes.get(),
+                        label_lists + ndis,
+                        distances,
+                        labels,
+                        k);
+            }
+
+            ndis += lens[i];
+        } catch (const std::exception&) {
+            break;
+        }
+    }
+
+    heap_reorder<HeapForIP>(k, distances, labels);
+
+    float sum = 0.0;
+    for (idx_t i = 0; i < k; i++) {
+        if (distances[i] >= min_score) {
+            sum += distances[i];
+        }
+    }
+    float avg_score = sum / k;
+    float mean_score = distances[k / 2];
+
+    int drop1 = 0;
+    int drop2 = 0;
+    int drop3 = 0;
+    for (float drop_score : drops) {
+        if (drop_score >= min_score) {
+            drop1++;
+        }
+        if (drop_score >= avg_score) {
+            drop2++;
+        }
+        if (drop_score >= mean_score) {
+            drop3++;
+        }
+    }
+    double t1 = getmillisecs();
+    printf("cost %f min=%f avg=%f mean=%f max=%f stop=%d miss=%d %d %d %d %d %d %d\n",
+           t1 - t0,
+           min_score,
+           avg_score,
+           mean_score,
+           max_score,
+           stop_i,
+           miss_centroid,
+           pred,
+           full,
+           hit,
+           drop1,
+           drop2,
+           drop3);
 }
 
 void IndexIVFScalarQuantizer::reconstruct_from_offset(

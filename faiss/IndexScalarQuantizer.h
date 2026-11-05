@@ -116,6 +116,16 @@ struct IndexIVFScalarQuantizer : IndexIVF {
             const IDSelector* sel,
             const IVFSearchParameters* params) const override;
 
+    void search_with_filter(
+            const float* x,
+            idx_t k,
+            idx_t* keys,
+            float* coarse_diss,
+            idx_t* lens,
+            idx_t* label_lists,
+            idx_t* labels,
+            float* distances) const override;
+
     void reconstruct_from_offset(int64_t list_no, int64_t offset, float* recons)
             const override;
 
