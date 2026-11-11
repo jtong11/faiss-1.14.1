@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 
 #include <omp.h>
@@ -280,6 +281,77 @@ void fvec_renorm_L2(size_t d, size_t nx, float* __restrict x) {
 
 namespace {
 
+template <class H>
+struct IsRangeBlockHandler : std::false_type {};
+
+template <class C, bool use_sel>
+struct IsRangeBlockHandler<RangeSearchBlockResultHandler<C, use_sel>>
+        : std::true_type {};
+
+// Threads a new parallel region will actually get. Nested regions are
+// serialized when OMP_MAX_ACTIVE_LEVELS is 1 (libgomp's default), so using
+// omp_get_max_threads() from inside IndexIVF's query-parallel search both
+// oversubscribes and, for a hand-split database loop, drops all but the
+// first 1/nt of the vectors.
+static int effective_knn_threads() {
+    if (omp_in_parallel()) {
+        return 1;
+    }
+    return std::max(1, omp_get_max_threads());
+}
+
+// How many queries to stream the database through together. Sized so the
+// queries stay in L1 while each database vector is reused.
+static size_t ip_query_tile(size_t d) {
+    constexpr size_t kMaxTile = 16;
+    constexpr size_t kBudgetBytes = 24 * 1024;
+    size_t tile = kMaxTile;
+    if (d > 0) {
+        size_t fit = kBudgetBytes / (sizeof(float) * d);
+        if (fit < tile) {
+            tile = fit;
+        }
+    }
+    return std::max<size_t>(tile, 1);
+}
+
+// One query against y[j0, j1), four database vectors at a time so the
+// FMAs are independent. A single running sum is latency-bound.
+template <SIMDLevel SL, class Handler>
+void scan_ip_one(
+        const float* x_i,
+        const float* y,
+        size_t d,
+        size_t j0,
+        size_t j1,
+        Handler& handler) {
+    size_t j = j0;
+    const size_t j4 = j0 + ((j1 - j0) & ~size_t(3));
+    for (; j < j4; j += 4) {
+        const float* y0 = y + j * d;
+        float ip0, ip1, ip2, ip3;
+        fvec_inner_product_batch_4<SL>(
+                x_i,
+                y0,
+                y0 + d,
+                y0 + 2 * d,
+                y0 + 3 * d,
+                d,
+                ip0,
+                ip1,
+                ip2,
+                ip3);
+        handler.add_result(ip0, j);
+        handler.add_result(ip1, j + 1);
+        handler.add_result(ip2, j + 2);
+        handler.add_result(ip3, j + 3);
+    }
+    for (; j < j1; j++) {
+        handler.add_result(
+                fvec_inner_product<SL>(x_i, y + j * d, d), j);
+    }
+}
+
 /* Find the nearest neighbors for nx queries in a set of ny vectors */
 template <class BlockResultHandler>
 void exhaustive_inner_product_seq(
@@ -289,31 +361,132 @@ void exhaustive_inner_product_seq(
         size_t nx,
         size_t ny,
         BlockResultHandler& res) {
+    if (nx == 0) {
+        return;
+    }
     using SingleResultHandler =
             typename BlockResultHandler::SingleResultHandler;
-    [[maybe_unused]] int nt = std::min(int(nx), omp_get_max_threads());
+    constexpr bool kRange = IsRangeBlockHandler<BlockResultHandler>::value;
+    size_t qblock = ip_query_tile(d);
+    const int nt_avail = effective_knn_threads();
+    // A tile larger than nx/nt leaves cores idle. Cap it so the query
+    // tiles cover the team, and still reuse each database vector across
+    // every query in the tile.
+    if (!kRange && res.sel == nullptr && nx > 1 && nt_avail > 1) {
+        const size_t max_q = (nx + static_cast<size_t>(nt_avail) - 1) /
+                static_cast<size_t>(nt_avail);
+        if (qblock > max_q) {
+            qblock = std::max<size_t>(max_q, 1);
+        }
+    }
+    // Range handlers own partial-result state in their destructor, so they
+    // stay on the one-handler-per-thread path. Selectors are sparse enough
+    // that the scalar loop is the right one.
+    const bool tile_queries =
+            !kRange && res.sel == nullptr && qblock > 1 && nx > 1;
+    const size_t nwork =
+            tile_queries ? (nx + qblock - 1) / qblock : nx;
+    const int nt =
+            std::min(static_cast<int>(nwork), effective_knn_threads());
 
-#pragma omp parallel num_threads(nt)
-    {
-        SingleResultHandler resi(res);
+    auto run = [&](size_t begin, size_t end) {
         with_simd_level([&]<SIMDLevel SL>() {
-#pragma omp for
-            for (int64_t i = 0; i < static_cast<int64_t>(nx); i++) {
-                const float* x_i = x + i * d;
-                const float* y_j = y;
-
-                resi.begin(i);
-
-                for (size_t j = 0; j < ny; j++, y_j += d) {
-                    if (!res.is_in_selection(j)) {
-                        continue;
+            auto scan_one_by_one = [&](size_t i0, size_t i1) {
+                SingleResultHandler resi(res);
+                for (size_t i = i0; i < i1; i++) {
+                    const float* x_i = x + i * d;
+                    resi.begin(i);
+                    if (res.sel == nullptr) {
+                        scan_ip_one<SL>(x_i, y, d, 0, ny, resi);
+                    } else {
+                        const float* y_j = y;
+                        for (size_t j = 0; j < ny; j++, y_j += d) {
+                            if (!res.is_in_selection(j)) {
+                                continue;
+                            }
+                            resi.add_result(
+                                    fvec_inner_product<SL>(x_i, y_j, d), j);
+                        }
                     }
-                    float ip = fvec_inner_product<SL>(x_i, y_j, d);
-                    resi.add_result(ip, j);
+                    resi.end();
                 }
-                resi.end();
+            };
+
+            if constexpr (!kRange) {
+                if (tile_queries) {
+                    std::vector<SingleResultHandler> hs;
+                    hs.reserve(qblock);
+                    for (size_t t = 0; t < qblock; t++) {
+                        hs.emplace_back(res);
+                    }
+                    for (size_t tile = begin; tile < end; tile++) {
+                        const size_t i0 = tile * qblock;
+                        const size_t i1 = std::min(i0 + qblock, nx);
+                        const size_t b = i1 - i0;
+                        for (size_t t = 0; t < b; t++) {
+                            hs[t].begin(i0 + t);
+                        }
+                        size_t j = 0;
+                        const size_t j4 = ny & ~size_t(3);
+                        for (; j < j4; j += 4) {
+                            const float* y0 = y + j * d;
+                            const float* y1 = y0 + d;
+                            const float* y2 = y1 + d;
+                            const float* y3 = y2 + d;
+                            for (size_t t = 0; t < b; t++) {
+                                float ip0, ip1, ip2, ip3;
+                                fvec_inner_product_batch_4<SL>(
+                                        x + (i0 + t) * d,
+                                        y0,
+                                        y1,
+                                        y2,
+                                        y3,
+                                        d,
+                                        ip0,
+                                        ip1,
+                                        ip2,
+                                        ip3);
+                                hs[t].add_result(ip0, j);
+                                hs[t].add_result(ip1, j + 1);
+                                hs[t].add_result(ip2, j + 2);
+                                hs[t].add_result(ip3, j + 3);
+                            }
+                        }
+                        for (; j < ny; j++) {
+                            const float* yj = y + j * d;
+                            for (size_t t = 0; t < b; t++) {
+                                hs[t].add_result(
+                                        fvec_inner_product<SL>(
+                                                x + (i0 + t) * d, yj, d),
+                                        j);
+                            }
+                        }
+                        for (size_t t = 0; t < b; t++) {
+                            hs[t].end();
+                        }
+                    }
+                } else {
+                    scan_one_by_one(begin, end);
+                }
+            } else {
+                scan_one_by_one(begin, end);
             }
         });
+    };
+
+    if (nt <= 1) {
+        run(0, nwork);
+    } else {
+#pragma omp parallel num_threads(nt)
+        {
+            const int tid = omp_get_thread_num();
+            const int nthreads = omp_get_num_threads();
+            const size_t i0 = nwork * static_cast<size_t>(tid) /
+                    static_cast<size_t>(nthreads);
+            const size_t i1 = nwork * static_cast<size_t>(tid + 1) /
+                    static_cast<size_t>(nthreads);
+            run(i0, i1);
+        }
     }
 }
 
@@ -327,9 +500,10 @@ void exhaustive_L2sqr_seq(
         BlockResultHandler& res) {
     using SingleResultHandler =
             typename BlockResultHandler::SingleResultHandler;
-    [[maybe_unused]] int nt = std::min(int(nx), omp_get_max_threads());
+    [[maybe_unused]] int nt =
+            std::min(static_cast<int>(nx), effective_knn_threads());
 
-#pragma omp parallel num_threads(nt)
+#pragma omp parallel num_threads(nt) if (nt > 1)
     {
         SingleResultHandler resi(res);
         with_simd_level([&]<SIMDLevel SL>() {
@@ -590,8 +764,10 @@ int distance_compute_blas_query_bs = 4096;
 int distance_compute_blas_database_bs = 1024;
 int distance_compute_min_k_reservoir = 100;
 
-// Database-parallel KNN: parallelizes over database segments instead of
-// queries, for the case where nx < nthreads and the database is large.
+// Database-parallel SGEMM: used when nx < nthreads and the database is
+// long enough that a wide GEMM panel pays for packing. Inner product
+// against an IVF coarse quantizer (nlist around 10k, a handful of queries)
+// is below that and goes through knn_inner_product_db_scan instead.
 static constexpr size_t kDbParallelMinVectors = 10000;
 
 template <class C>
@@ -608,12 +784,16 @@ static void knn_db_parallel_impl(
     using T = typename C::T;
     using TI = typename C::TI;
 
-    int nt = omp_get_max_threads();
+    int nt = effective_knn_threads();
     const size_t bs_y = distance_compute_blas_database_bs;
 
     // Per-thread result heaps: nt threads x nx queries x k results
     std::vector<T> all_dis(static_cast<size_t>(nt) * nx * k);
     std::vector<TI> all_ids(static_cast<size_t>(nt) * nx * k);
+    // The region may run with fewer threads than requested (nested OpenMP
+    // is serialized). Split and merge by the team that actually ran, or
+    // the other heaps stay zero-filled and corrupt the top-k.
+    int nt_used = 1;
 
     std::unique_ptr<float[]> x_norms_storage;
     std::unique_ptr<float[]> y_norms_storage;
@@ -632,9 +812,15 @@ static void knn_db_parallel_impl(
 
 #pragma omp parallel num_threads(nt)
     {
-        int tid = omp_get_thread_num();
-        size_t j_begin = static_cast<size_t>(tid) * ny / nt;
-        size_t j_end = static_cast<size_t>(tid + 1) * ny / nt;
+        const int nthreads = omp_get_num_threads();
+        const int tid = omp_get_thread_num();
+        if (tid == 0) {
+            nt_used = nthreads;
+        }
+        size_t j_begin = static_cast<size_t>(tid) * ny /
+                static_cast<size_t>(nthreads);
+        size_t j_end = static_cast<size_t>(tid + 1) * ny /
+                static_cast<size_t>(nthreads);
         size_t local_ny = j_end - j_begin;
 
         // Compute y_norms for this thread's segment (cache locality)
@@ -720,7 +906,7 @@ static void knn_db_parallel_impl(
     for (int64_t i = 0; i < static_cast<int64_t>(nx); i++) {
         heap_heapify<C>(k, vals + i * k, ids + i * k);
 
-        for (int t = 0; t < nt; t++) {
+        for (int t = 0; t < nt_used; t++) {
             T* t_dis = all_dis.data() + (t * nx + i) * k;
             TI* t_ids = all_ids.data() + (t * nx + i) * k;
             T* out_dis = vals + i * k;
@@ -745,12 +931,135 @@ static bool should_use_db_parallel(
     if (sel) {
         return false;
     }
-    int nt = omp_get_max_threads();
+    int nt = effective_knn_threads();
     size_t min_ny = std::max(
             kDbParallelMinVectors,
             static_cast<size_t>(nt) *
                     static_cast<size_t>(distance_compute_blas_database_bs));
     return nt > 1 && nx < static_cast<size_t>(nt) && ny >= min_ny;
+}
+
+// Fused inner-product scan for a narrow query panel. SGEMM packing plus a
+// second pass over the distance tile costs more than the dots themselves
+// when nlist is about 10k and only a few queries are in flight. Parallelize
+// over database segments and keep a heap per query, four dots at a time.
+static bool should_use_ip_db_scan(size_t nx, size_t ny, size_t d) {
+    if (nx == 0 || ny == 0) {
+        return false;
+    }
+    const int nt = effective_knn_threads();
+    if (nt <= 1 || nx >= static_cast<size_t>(nt)) {
+        return false;
+    }
+    if (ny < 4096 || ny < static_cast<size_t>(nt) * 64) {
+        return false;
+    }
+    // Fork/join dominates a single short scan (for example one query at
+    // d=128 against 10k centroids). Those stay on the single-thread kernel.
+    if (nx * ny * std::max<size_t>(d, 1) < 2000000) {
+        return false;
+    }
+    const bool sgemm_worth = nx >= 16 &&
+            ny >= std::max(
+                          kDbParallelMinVectors,
+                          static_cast<size_t>(nt) *
+                                  static_cast<size_t>(
+                                          distance_compute_blas_database_bs));
+    return !sgemm_worth;
+}
+
+static void knn_inner_product_db_scan(
+        const float* x,
+        const float* y,
+        size_t d,
+        size_t nx,
+        size_t ny,
+        size_t k,
+        float* vals,
+        int64_t* ids) {
+    using C = CMin<float, int64_t>;
+    const int nt = effective_knn_threads();
+    std::vector<float> all_dis(static_cast<size_t>(nt) * nx * k);
+    std::vector<int64_t> all_ids(static_cast<size_t>(nt) * nx * k);
+    int nt_used = 1;
+
+    size_t y_block = 256;
+    if (d > 0) {
+        size_t fit = (32 * 1024) / (sizeof(float) * d);
+        fit &= ~size_t(3);
+        if (fit >= 4) {
+            y_block = fit;
+        }
+    }
+
+#pragma omp parallel num_threads(nt)
+    {
+        const int nthreads = omp_get_num_threads();
+        const int tid = omp_get_thread_num();
+        if (tid == 0) {
+            nt_used = nthreads;
+        }
+        const size_t j_begin = static_cast<size_t>(tid) * ny /
+                static_cast<size_t>(nthreads);
+        const size_t j_end = static_cast<size_t>(tid + 1) * ny /
+                static_cast<size_t>(nthreads);
+
+        float* my_dis = all_dis.data() + static_cast<size_t>(tid) * nx * k;
+        int64_t* my_ids = all_ids.data() + static_cast<size_t>(tid) * nx * k;
+        for (size_t i = 0; i < nx; i++) {
+            heap_heapify<C>(k, my_dis + i * k, my_ids + i * k);
+        }
+
+        struct PartialHeap {
+            size_t k;
+            float* dis;
+            int64_t* ids;
+            float thresh;
+            void add_result(float ip, size_t id) {
+                if (C::cmp(thresh, ip)) {
+                    heap_replace_top<C>(
+                            k, dis, ids, ip, static_cast<int64_t>(id));
+                    thresh = dis[0];
+                }
+            }
+        };
+
+        if (j_begin < j_end) {
+            std::vector<PartialHeap> heaps(nx);
+            for (size_t i = 0; i < nx; i++) {
+                heaps[i] = PartialHeap{
+                        k, my_dis + i * k, my_ids + i * k, my_dis[i * k]};
+            }
+            with_simd_level([&]<SIMDLevel SL>() {
+                for (size_t j0 = j_begin; j0 < j_end; j0 += y_block) {
+                    const size_t j1 = std::min(j0 + y_block, j_end);
+                    for (size_t i = 0; i < nx; i++) {
+                        scan_ip_one<SL>(x + i * d, y, d, j0, j1, heaps[i]);
+                    }
+                }
+            });
+        }
+    }
+
+#pragma omp parallel for if (nx > 1)
+    for (int64_t i = 0; i < static_cast<int64_t>(nx); i++) {
+        heap_heapify<C>(k, vals + i * k, ids + i * k);
+        float* out_dis = vals + i * k;
+        int64_t* out_ids = ids + i * k;
+        for (int t = 0; t < nt_used; t++) {
+            const float* t_dis =
+                    all_dis.data() + (static_cast<size_t>(t) * nx + i) * k;
+            const int64_t* t_ids =
+                    all_ids.data() + (static_cast<size_t>(t) * nx + i) * k;
+            for (size_t j = 0; j < k; j++) {
+                if (t_ids[j] >= 0 && C::cmp(out_dis[0], t_dis[j])) {
+                    heap_replace_top<C>(
+                            k, out_dis, out_ids, t_dis[j], t_ids[j]);
+                }
+            }
+        }
+        heap_reorder<C>(k, vals + i * k, ids + i * k);
+    }
 }
 
 void knn_inner_product(
@@ -777,7 +1086,9 @@ void knn_inner_product(
         return;
     }
 
-    if (should_use_db_parallel(nx, ny, sel)) {
+    if (sel == nullptr && k > 0 && should_use_ip_db_scan(nx, ny, d)) {
+        knn_inner_product_db_scan(x, y, d, nx, ny, k, vals, ids);
+    } else if (should_use_db_parallel(nx, ny, sel)) {
         knn_db_parallel_impl<CMin<float, int64_t>>(
                 x, y, d, nx, ny, k, vals, ids, nullptr);
     } else {
