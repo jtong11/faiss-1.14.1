@@ -13,6 +13,8 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <type_traits>
+#include <vector>
 
 #include <omp.h>
 
@@ -249,6 +251,139 @@ void fvec_renorm_L2(size_t d, size_t nx, float* __restrict x) {
 
 namespace {
 
+template <class H>
+struct IsRangeBlockHandler : std::false_type {};
+
+template <class C, bool use_sel>
+struct IsRangeBlockHandler<RangeSearchBlockResultHandler<C, use_sel>>
+        : std::true_type {};
+
+// A nested parallel region is serialized when OMP_MAX_ACTIVE_LEVELS is 1
+// (libgomp's default). IndexIVF already parallelizes over queries, so the
+// quantizer scan must not start another team.
+static int effective_knn_threads() {
+    if (omp_in_parallel()) {
+        return 1;
+    }
+    return std::max(1, omp_get_max_threads());
+}
+
+// Queries streamed together so each database vector stays in L1.
+static size_t ip_query_tile(size_t d) {
+    constexpr size_t kMaxTile = 16;
+    constexpr size_t kBudgetBytes = 24 * 1024;
+    size_t tile = kMaxTile;
+    if (d > 0) {
+        size_t fit = kBudgetBytes / (sizeof(float) * d);
+        if (fit < tile) {
+            tile = fit;
+        }
+    }
+    return std::max<size_t>(tile, 1);
+}
+
+// Four database vectors at a time: one running sum is FMA-latency bound.
+template <SIMDLevel SL, class Handler>
+void ip_scan_one(
+        Handler& handler,
+        const float* x_i,
+        const float* y,
+        size_t d,
+        size_t j0,
+        size_t j1) {
+    size_t j = j0;
+    const size_t j4 = j0 + ((j1 - j0) & ~size_t(3));
+    for (; j < j4; j += 4) {
+        const float* y0 = y + j * d;
+        float ip0, ip1, ip2, ip3;
+        fvec_inner_product_batch_4<SL>(
+                x_i,
+                y0,
+                y0 + d,
+                y0 + 2 * d,
+                y0 + 3 * d,
+                d,
+                ip0,
+                ip1,
+                ip2,
+                ip3);
+        handler.add_result(ip0, j);
+        handler.add_result(ip1, j + 1);
+        handler.add_result(ip2, j + 2);
+        handler.add_result(ip3, j + 3);
+    }
+    for (; j < j1; j++) {
+        handler.add_result(fvec_inner_product<SL>(x_i, y + j * d, d), j);
+    }
+}
+
+template <class Handler>
+void ip_scan_one_dispatch(
+        Handler& handler,
+        const float* x_i,
+        const float* y,
+        size_t d,
+        size_t j0,
+        size_t j1) {
+    DISPATCH_SIMDLevel(ip_scan_one, handler, x_i, y, d, j0, j1);
+}
+
+template <SIMDLevel SL, class Handler>
+void ip_scan_tile(
+        Handler* hs,
+        const float* x,
+        const float* y,
+        size_t d,
+        size_t i0,
+        size_t b,
+        size_t ny) {
+    size_t j = 0;
+    const size_t j4 = ny & ~size_t(3);
+    for (; j < j4; j += 4) {
+        const float* y0 = y + j * d;
+        const float* y1 = y0 + d;
+        const float* y2 = y1 + d;
+        const float* y3 = y2 + d;
+        for (size_t t = 0; t < b; t++) {
+            float ip0, ip1, ip2, ip3;
+            fvec_inner_product_batch_4<SL>(
+                    x + (i0 + t) * d,
+                    y0,
+                    y1,
+                    y2,
+                    y3,
+                    d,
+                    ip0,
+                    ip1,
+                    ip2,
+                    ip3);
+            hs[t].add_result(ip0, j);
+            hs[t].add_result(ip1, j + 1);
+            hs[t].add_result(ip2, j + 2);
+            hs[t].add_result(ip3, j + 3);
+        }
+    }
+    for (; j < ny; j++) {
+        const float* yj = y + j * d;
+        for (size_t t = 0; t < b; t++) {
+            hs[t].add_result(
+                    fvec_inner_product<SL>(x + (i0 + t) * d, yj, d), j);
+        }
+    }
+}
+
+template <class Handler>
+void ip_scan_tile_dispatch(
+        Handler* hs,
+        const float* x,
+        const float* y,
+        size_t d,
+        size_t i0,
+        size_t b,
+        size_t ny) {
+    DISPATCH_SIMDLevel(ip_scan_tile, hs, x, y, d, i0, b, ny);
+}
+
 /* Find the nearest neighbors for nx queries in a set of ny vectors */
 template <class BlockResultHandler>
 void exhaustive_inner_product_seq(
@@ -258,28 +393,89 @@ void exhaustive_inner_product_seq(
         size_t nx,
         size_t ny,
         BlockResultHandler& res) {
+    if (nx == 0) {
+        return;
+    }
     using SingleResultHandler =
             typename BlockResultHandler::SingleResultHandler;
-    [[maybe_unused]] int nt = std::min(int(nx), omp_get_max_threads());
+    constexpr bool kRange = IsRangeBlockHandler<BlockResultHandler>::value;
+    size_t qblock = ip_query_tile(d);
+    const int nt_avail = effective_knn_threads();
+    if (!kRange && res.sel == nullptr && nx > 1 && nt_avail > 1) {
+        const size_t max_q = (nx + static_cast<size_t>(nt_avail) - 1) /
+                static_cast<size_t>(nt_avail);
+        if (qblock > max_q) {
+            qblock = std::max<size_t>(max_q, 1);
+        }
+    }
+    // Range handlers finalize partial results in their destructor, so they
+    // stay one-handler-per-thread. Selectors stay on the scalar loop.
+    const bool tile_queries =
+            !kRange && res.sel == nullptr && qblock > 1 && nx > 1;
+    const size_t nwork = tile_queries ? (nx + qblock - 1) / qblock : nx;
+    const int nt = std::min(static_cast<int>(nwork), nt_avail);
 
-#pragma omp parallel num_threads(nt)
-    {
-        SingleResultHandler resi(res);
-#pragma omp for
-        for (int64_t i = 0; i < nx; i++) {
-            const float* x_i = x + i * d;
-            const float* y_j = y;
-
-            resi.begin(i);
-
-            for (size_t j = 0; j < ny; j++, y_j += d) {
-                if (!res.is_in_selection(j)) {
-                    continue;
+    auto run = [&](size_t begin, size_t end) {
+        auto scan_one_by_one = [&](size_t i0, size_t i1) {
+            SingleResultHandler resi(res);
+            for (size_t i = i0; i < i1; i++) {
+                const float* x_i = x + i * d;
+                resi.begin(i);
+                if (res.sel == nullptr) {
+                    ip_scan_one_dispatch(resi, x_i, y, d, 0, ny);
+                } else {
+                    const float* y_j = y;
+                    for (size_t j = 0; j < ny; j++, y_j += d) {
+                        if (!res.is_in_selection(j)) {
+                            continue;
+                        }
+                        float ip = fvec_inner_product_dispatch(x_i, y_j, d);
+                        resi.add_result(ip, j);
+                    }
                 }
-                float ip = fvec_inner_product_dispatch(x_i, y_j, d);
-                resi.add_result(ip, j);
+                resi.end();
             }
-            resi.end();
+        };
+
+        if constexpr (!kRange) {
+            if (tile_queries) {
+                std::vector<SingleResultHandler> hs;
+                hs.reserve(qblock);
+                for (size_t t = 0; t < qblock; t++) {
+                    hs.emplace_back(res);
+                }
+                for (size_t tile = begin; tile < end; tile++) {
+                    const size_t i0 = tile * qblock;
+                    const size_t i1 = std::min(i0 + qblock, nx);
+                    const size_t b = i1 - i0;
+                    for (size_t t = 0; t < b; t++) {
+                        hs[t].begin(i0 + t);
+                    }
+                    ip_scan_tile_dispatch(hs.data(), x, y, d, i0, b, ny);
+                    for (size_t t = 0; t < b; t++) {
+                        hs[t].end();
+                    }
+                }
+            } else {
+                scan_one_by_one(begin, end);
+            }
+        } else {
+            scan_one_by_one(begin, end);
+        }
+    };
+
+    if (nt <= 1) {
+        run(0, nwork);
+    } else {
+#pragma omp parallel num_threads(nt)
+        {
+            const int tid = omp_get_thread_num();
+            const int nthreads = omp_get_num_threads();
+            const size_t i0 = nwork * static_cast<size_t>(tid) /
+                    static_cast<size_t>(nthreads);
+            const size_t i1 = nwork * static_cast<size_t>(tid + 1) /
+                    static_cast<size_t>(nthreads);
+            run(i0, i1);
         }
     }
 }
@@ -923,7 +1119,10 @@ struct Run_search_inner_product {
            size_t d,
            size_t nx,
            size_t ny) {
-        if (res.sel || nx < distance_compute_blas_threshold) {
+        // A coarse quantizer has ny == nlist, often 10000. SGEMM packing
+        // dominates that panel, and a multi-threaded BLAS pool
+        // oversubscribes the OpenMP team IndexIVF already started.
+        if (res.sel || nx < distance_compute_blas_threshold || ny <= 65536) {
             exhaustive_inner_product_seq(x, y, d, nx, ny, res);
         } else {
             exhaustive_inner_product_blas(x, y, d, nx, ny, res);
@@ -948,6 +1147,119 @@ struct Run_search_L2sqr {
         }
     }
 };
+
+// Few queries against ~nlist centroids. Split the database across threads
+// and keep a heap per query, instead of one dot product at a time.
+static bool should_use_ip_db_scan(size_t nx, size_t ny, size_t d) {
+    if (nx == 0 || ny == 0) {
+        return false;
+    }
+    const int nt = effective_knn_threads();
+    if (nt <= 1 || nx >= static_cast<size_t>(nt)) {
+        return false;
+    }
+    if (ny < 4096 || ny < static_cast<size_t>(nt) * 64) {
+        return false;
+    }
+    // Fork/join dominates one short scan, e.g. d=128 against 10k centroids.
+    if (nx * ny * std::max<size_t>(d, 1) < 2000000) {
+        return false;
+    }
+    return true;
+}
+
+static void knn_inner_product_db_scan(
+        const float* x,
+        const float* y,
+        size_t d,
+        size_t nx,
+        size_t ny,
+        size_t k,
+        float* vals,
+        int64_t* ids) {
+    using C = CMin<float, int64_t>;
+    const int nt = effective_knn_threads();
+    std::vector<float> all_dis(static_cast<size_t>(nt) * nx * k);
+    std::vector<int64_t> all_ids(static_cast<size_t>(nt) * nx * k);
+    int nt_used = 1;
+
+    size_t y_block = 256;
+    if (d > 0) {
+        size_t fit = (32 * 1024) / (sizeof(float) * d);
+        fit &= ~size_t(3);
+        if (fit >= 4) {
+            y_block = fit;
+        }
+    }
+
+    struct PartialHeap {
+        size_t k;
+        float* dis;
+        int64_t* ids;
+        float thresh;
+        void add_result(float ip, size_t id) {
+            if (C::cmp(thresh, ip)) {
+                heap_replace_top<C>(k, dis, ids, ip, static_cast<int64_t>(id));
+                thresh = dis[0];
+            }
+        }
+    };
+
+#pragma omp parallel num_threads(nt)
+    {
+        const int nthreads = omp_get_num_threads();
+        const int tid = omp_get_thread_num();
+        if (tid == 0) {
+            nt_used = nthreads;
+        }
+        const size_t j_begin = static_cast<size_t>(tid) * ny /
+                static_cast<size_t>(nthreads);
+        const size_t j_end = static_cast<size_t>(tid + 1) * ny /
+                static_cast<size_t>(nthreads);
+
+        float* my_dis = all_dis.data() + static_cast<size_t>(tid) * nx * k;
+        int64_t* my_ids = all_ids.data() + static_cast<size_t>(tid) * nx * k;
+        for (size_t i = 0; i < nx; i++) {
+            heap_heapify<C>(k, my_dis + i * k, my_ids + i * k);
+        }
+        if (j_begin < j_end) {
+            std::vector<PartialHeap> heaps(nx);
+            for (size_t i = 0; i < nx; i++) {
+                heaps[i].k = k;
+                heaps[i].dis = my_dis + i * k;
+                heaps[i].ids = my_ids + i * k;
+                heaps[i].thresh = my_dis[i * k];
+            }
+            for (size_t j0 = j_begin; j0 < j_end; j0 += y_block) {
+                const size_t j1 = std::min(j0 + y_block, j_end);
+                for (size_t i = 0; i < nx; i++) {
+                    ip_scan_one_dispatch(
+                            heaps[i], x + i * d, y, d, j0, j1);
+                }
+            }
+        }
+    }
+
+#pragma omp parallel for if (nx > 1)
+    for (int64_t i = 0; i < static_cast<int64_t>(nx); i++) {
+        heap_heapify<C>(k, vals + i * k, ids + i * k);
+        float* out_dis = vals + i * k;
+        int64_t* out_ids = ids + i * k;
+        for (int t = 0; t < nt_used; t++) {
+            const float* t_dis =
+                    all_dis.data() + (static_cast<size_t>(t) * nx + i) * k;
+            const int64_t* t_ids =
+                    all_ids.data() + (static_cast<size_t>(t) * nx + i) * k;
+            for (size_t j = 0; j < k; j++) {
+                if (t_ids[j] >= 0 && C::cmp(out_dis[0], t_dis[j])) {
+                    heap_replace_top<C>(
+                            k, out_dis, out_ids, t_dis[j], t_ids[j]);
+                }
+            }
+        }
+        heap_reorder<C>(k, vals + i * k, ids + i * k);
+    }
+}
 
 } // anonymous namespace
 
@@ -984,9 +1296,24 @@ void knn_inner_product(
         return;
     }
 
-    Run_search_inner_product r;
-    dispatch_knn_ResultHandler(
-            nx, vals, ids, k, METRIC_INNER_PRODUCT, sel, r, x, y, d, nx, ny);
+    if (sel == nullptr && k > 0 && should_use_ip_db_scan(nx, ny, d)) {
+        knn_inner_product_db_scan(x, y, d, nx, ny, k, vals, ids);
+    } else {
+        Run_search_inner_product r;
+        dispatch_knn_ResultHandler(
+                nx,
+                vals,
+                ids,
+                k,
+                METRIC_INNER_PRODUCT,
+                sel,
+                r,
+                x,
+                y,
+                d,
+                nx,
+                ny);
+    }
 
     if (imin != 0) {
         for (size_t i = 0; i < nx * k; i++) {
