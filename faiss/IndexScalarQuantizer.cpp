@@ -525,7 +525,7 @@ void IndexIVFScalarQuantizer::search_with_filter(
     invlists->prefetch_lists(keys, static_cast<int>(nkeys));
 
     size_t nlistv = 0, ndis = 0, nheap = 0;
-    float min_score = std::max(0.01f, distances[0]);
+    float min_score = -1.0f * d;
     float max_score = min_score;
 
     double t0 = getmillisecs();
@@ -581,7 +581,7 @@ void IndexIVFScalarQuantizer::search_with_filter(
                     full++;
 
                     if (accu > min_score && accu > distances[0]) {
-                        heap_replace_top<HeapForIP>(
+                        minheap_replace_top(
                                 k, distances, labels, accu, label);
                         nheap++;
 
@@ -598,16 +598,14 @@ void IndexIVFScalarQuantizer::search_with_filter(
                     codes += scanner_code_size;
                 }
 
-                float hit_ratio = 1000 * hits[i] / static_cast<float>(lens[i]);
-                if (hit_ratio < 1.0) {
+                if (hits[i] < 1.0) {
                     miss_centroid++;
                 }
 
-                if (nkeys < nlist) {
+                if (static_cast<size_t>(nkeys) <=
+                    std::min((size_t)200, nlist)) {
                     if (coarse_diss[i] < min_score * 0.9 &&
-                        miss_centroid >
-                                std::max(200, static_cast<int>(nkeys)) *
-                                        0.382) {
+                        miss_centroid > std::max(200, (int)nkeys) * 0.25) {
                         if (!collect_drops) {
                             collect_drops = true;
                             stop_i = i;

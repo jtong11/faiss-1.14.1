@@ -423,12 +423,13 @@ void IndexIVF::search_with_filter(
     invlists->prefetch_lists(keys, static_cast<int>(nkeys));
 
     size_t nlistv = 0, ndis = 0, nheap = 0;
-    float min_score = std::max(0.01f, distances[0]);
+    float min_score = -1.0f * d;
     float max_score = min_score;
 
     double t0 = getmillisecs();
 
-    std::unique_ptr<InvertedListScanner> scanner(get_InvertedListScanner(false));
+    std::unique_ptr<InvertedListScanner> scanner(
+            get_InvertedListScanner(false));
     scanner->set_query(x);
 
     using HeapForIP = CMin<float, idx_t>;
@@ -457,14 +458,13 @@ void IndexIVF::search_with_filter(
             InvertedLists::ScopedCodes scodes(invlists, keys[i]);
 
             const uint8_t* codes = scodes.get();
-            const size_t scanner_code_size = scanner->code_size;
+            const size_t code_size = scanner->code_size;
 
-            if (scanner_code_size > 0) {
+            if (code_size > 0) {
                 hits[i] = 0;
                 for (idx_t n = 0; n < lens[i]; n++) {
-                    const idx_t label = label_lists[ndis + n];
-                    if (label == -1) {
-                        codes += scanner_code_size;
+                    if (label_lists[ndis + n] == -1) {
+                        codes += code_size;
                         continue;
                     }
 
@@ -473,42 +473,36 @@ void IndexIVF::search_with_filter(
                     const float accu = scanner->distance_to_code(codes);
                     full++;
 
-                    if (metric_type == METRIC_INNER_PRODUCT) {
-                        if (accu > min_score && accu > distances[0]) {
-                            heap_replace_top<HeapForIP>(
-                                    k, distances, labels, accu, label);
-                            nheap++;
-
-                            min_score = std::max(min_score, distances[0]);
-                            max_score = std::max(max_score, accu);
-                            hit++;
-                            hits[i]++;
-
-                            if (collect_drops) {
-                                drops.push_back(accu);
-                            }
-                        }
-                    } else if (accu < distances[0]) {
-                        heap_replace_top<HeapForL2>(
-                                k, distances, labels, accu, label);
+                    if (accu > min_score && accu > distances[0]) {
+                        minheap_replace_top(
+                                k,
+                                distances,
+                                labels,
+                                accu,
+                                label_lists[ndis + n]);
                         nheap++;
+
+                        min_score = std::max(min_score, distances[0]);
+                        max_score = std::max(max_score, accu);
                         hit++;
                         hits[i]++;
+
+                        if (collect_drops) {
+                            drops.push_back(accu);
+                        }
                     }
 
-                    codes += scanner_code_size;
+                    codes += code_size;
                 }
 
-                float hit_ratio = 1000 * hits[i] / static_cast<float>(lens[i]);
-                if (hit_ratio < 1.0) {
+                if (hits[i] < 1.0) {
                     miss_centroid++;
                 }
 
-                if (metric_type == METRIC_INNER_PRODUCT && nkeys < nlist) {
+                if (static_cast<size_t>(nkeys) <=
+                    std::min((size_t)200, nlist)) {
                     if (coarse_diss[i] < min_score * 0.9 &&
-                        miss_centroid >
-                                std::max(200, static_cast<int>(nkeys)) *
-                                        0.382) {
+                        miss_centroid > std::max(200, (int)nkeys) * 0.25) {
                         if (!collect_drops) {
                             collect_drops = true;
                             stop_i = i;
